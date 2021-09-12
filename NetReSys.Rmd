@@ -1,0 +1,936 @@
+---
+title: "Netflix Recomendation System - HarvardX Capstone Report"
+author: "Thierry Morvany"
+date: "09/09/2021"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 3
+---
+
+
+```{r Fetch, include=FALSE}
+knitr::opts_chunk$set(echo= FALSE, warning= FALSE, message= FALSE,
+                      fig.width=6, fig.height=4, fig.align="center") 
+library(tidyverse)
+library(caret)
+library(data.table)
+library(lubridate)
+library(recommenderlab)
+library(ggplot2)
+library(ggrepel)
+library(ggthemes)
+
+
+options(digits = 6)
+
+dl <- tempfile()
+download.file("http://files.grouplens.org/datasets/movielens/ml-10m.zip", dl)
+
+ratings <- fread(text = gsub("::", "\t", readLines(unzip(dl, "ml-10M100K/ratings.dat"))),
+                 col.names = c("userId", "movieId", "rating", "timestamp"))
+
+movies <- str_split_fixed(readLines(unzip(dl, "ml-10M100K/movies.dat")), "\\::", 3)
+colnames(movies) <- c("movieId", "title", "genres")
+
+
+movies <- as.data.frame(movies) %>% mutate(movieId = as.numeric(movieId),
+                                           title = as.character(title),
+                                           genres = as.character(genres))
+
+
+movielens <- left_join(ratings, movies, by = "movieId")
+
+#--- Get Number of Users, movies and genres
+counts <- movielens %>%
+  summarize(n_users = n_distinct(userId),        # 69878
+            n_movies = n_distinct(movieId),      # 10677
+            n_genres = n_distinct(genres))       # 797
+nb <- movielens %>% 
+       separate_rows(genres, sep = "\\|") %>% 
+       summarize(genres = n_distinct(genres))    # 20
+
+# movielens <- movielens %>% select(c(userId, movieId, rating))
+
+#--- Quick execution
+# movielens <- movielens[1:100]  
+  
+```
+\pagebreak
+
+## I- Introduction
+The Movielens project is part of the final course in the **HarvardX Professional Certificate in Data Science**.
+And this report is part of the Movielens project. The challenge is to create and evaluate prediction models that will predict the ratings some Netflix users would assign to some movies.\  
+The Netflix data is not publicly available so I used the dataset MovieLens proposed by HarvardX and provided by [*\textcolor{blue}{GroupLens research Lab}*](https://grouplens.org/). The dataset consists of `r counts$n_users` users who rated `r counts$n_movies` movies grouped in `r counts$n_genres` combinations of `r nb$genres` distinct genres.
+In this report, I start with a shallow analysis of the dataset then, I describe the different models evaluated to develop a recommendation system to be applied to Netflix movies ratings.\   
+Please, note that my 16GB-ram laptop was not powerfull enough all along. I then had to create an instance -of type r5.4xlarge on an Amazon Web Services (AWS) account to run the code built with R version `r getRversion()`. The creation procedure is described [*\textcolor{blue}{here}.*](https://jagg19.github.io/2019/08/aws-r/) 
+
+
+## II- Data Analysis
+
+I start with a quick overview of the ratings distributed across the genres:
+
+```{r Analysis}
+
+df_ratings <-   movielens  %>%
+  mutate(rating = as.factor(rating)) %>%
+  group_by(rating)   %>%
+  summarise(n= n())  %>%
+  arrange(desc(as.numeric(rating))) %>%
+  mutate(prop = round((cumsum(n)/sum(n))*100,2))
+
+movielens %>% 
+  mutate(rating = as.factor(rating)) %>% 
+  group_by(rating) %>% 
+  summarise(n= n())  %>% 
+  ggplot(aes(rating, n)) + 
+  geom_bar(stat = "identity", fill= "steelblue") +
+  ggtitle("Rating frequency") +
+  xlab("Rating") +
+  ylab("Number of Ratings") +
+  theme(plot.title = element_text(color="steelblue", size=14, face="bold", hjust = 0.5),
+        axis.title.x = element_text(color="steelblue", size=11),
+        axis.title.y = element_text(color="steelblue", size=11)) 
+
+
+```
+We can clearly see that a large majority (`r df_ratings[df_ratings$rating==3, "prop"]` %) of the marks are above 2.5, and even `r df_ratings[df_ratings$rating==4, "prop"]` % of the marks are a 4 or over. I expected a more balanced distributions across the ratings. Nevertheless, it makes sense as people often watch movies pitched and recommended by a friend... or a good recommendation system!
+\  \  
+We observe below that the genres of blockbusters movies like drama, comedy or action movies are often rated.
+On the other hand, film-noir, documentaries or IMAX movies are not often rated, probably due to their scarcity in the movie market.
+
+
+```{r RatingFrequency}
+rm(df_ratings)
+
+movielens %>% 
+  separate_rows(genres, sep = "\\|") %>% 
+  group_by(genres) %>%
+  summarise(rating = n()) %>% 
+  arrange(desc(rating)) %>% 
+  mutate(genres= reorder(genres, rating)) %>%
+  ggplot(aes(genres, rating)) +
+    geom_bar(stat="identity", fill="steelblue") +
+    ggtitle("Rating frequency") +
+    xlab("Genres") +
+    ylab("Number of Ratings") +
+    theme(plot.title = element_text(color="steelblue", size=14, face= "bold", hjust = 0.5),
+        axis.title.x = element_text(color="steelblue", size=11),
+        axis.title.y = element_text(color="steelblue", size=11)) +
+    coord_flip()
+
+```
+
+At genre level, let's see how users mark the movies they have watched. I try to boxplot the distribution of rating by genre:
+
+```{r RatingVsGenre}
+
+movielens %>% 
+  separate_rows(genres, sep = "\\|") %>% 
+  select(genres, rating) %>% 
+  group_by(genres) %>%
+  mutate(mn = median(rating)) %>%
+  ggplot(aes(x=reorder(genres, mn), y= rating)) +
+  geom_boxplot() +
+  ggtitle("Genres vs Rating") +
+  coord_flip() +
+  xlab("Genre") +
+  ylab("Rating") +
+  theme(plot.title = element_text(color="steelblue", size= 14, face= "bold", hjust = 0.5),
+        axis.title.x = element_text(color="steelblue", size=11),
+        axis.title.y = element_text(color="steelblue", size=11)) +
+  theme(legend.position='none')
+
+```
+It is not possible to analyze such a monolithic graph! Then, I decided to use regularisation to balance number of rating effect. To achieve this, I use the values $\mu_{v}$ = 3.9 and $\lambda_{v}$ = 4.4.\  
+This values will be calculated in the machine learning analysis in the chapter *III-4 MODEL 4: Model 3 + Factorisation*
+
+
+```{r }
+
+mu <- 3.9
+lambda <- 4.4
+genre_reg_avgs <- movielens %>%
+   separate_rows(genres, sep = "\\|") %>% 
+   group_by(genres) %>%
+   summarize(b_i = sum(rating - mu)/(n()+lambda), n_i = n())
+
+movielens %>% 
+      separate_rows(genres, sep = "\\|") %>% 
+      count(genres) %>%
+      left_join(genre_reg_avgs, by = "genres") %>%
+      arrange(desc(b_i)) %>%  
+  ggplot(aes(x=reorder(genres, b_i), y= mu+b_i), fill="steelblue") +
+  geom_point(color= "steelblue") +
+  ggtitle("Genres vs Rating") +
+  coord_flip() +
+  xlab("Genre") +
+  ylab("Regularised rating") +
+  theme(plot.title = element_text(color="steelblue", size=14, face= "bold", hjust = 0.5),
+        plot.subtitle = element_text(color="steelblue", size=12, face= "italic", hjust = 0.5),
+        axis.title.x = element_text(color="steelblue", size=11),
+        axis.title.y = element_text(color="steelblue", size=11)) +
+  theme(legend.position='none') 
+
+```
+
+The genres film noir, documentary and IMAX are clearly the best marked genres but also the less often marked/watched. We may think these genres are probably a connoisseur' privilege.
+On the other side, the genre action get the highest rating frequency and one of the worst regularised rating. It is more the genre of blockbusters that drains many viewers who are sometimes disappointed.\  
+I could analyze the data set in many other axis, but let's go on with the development of a recommendation system.
+
+
+```{r Wrangling, include=FALSE}
+# Validation set will be 10% of MovieLens data
+set.seed(1, sample.kind="Rounding") # if using R 3.5 or earlier, use `set.seed(1)`
+test_index <- createDataPartition(y = movielens$rating, times = 1, p = 0.1, list = FALSE)
+edx <- movielens[-test_index,]
+temp <- movielens[test_index,]
+
+# Make sure userId and movieId in validation set are also in edx set
+validation <- temp %>% 
+  semi_join(edx, by = "movieId") %>%
+  semi_join(edx, by = "userId")
+
+# Add rows removed from validation set back into edx set
+removed <- anti_join(temp, validation)
+edx <- rbind(edx, removed)
+
+# Remove temp Data
+rm(dl, ratings, movies, test_index, temp, movielens, removed)
+
+#--- RMSE function
+RMSE <- function(true_ratings, predicted_ratings){
+  sqrt(mean((true_ratings - predicted_ratings)^2))
+}
+```
+
+\pagebreak
+
+## III- Methods
+The purpose of a machine learning algorithm is to train an algorithm using a train dataset for which we do know the outcome. Then, the algorithm computes some **predicted ratings** for a validation set for which we also know the outcome. Finally, how close the **predicted ratings** are from the **True ratings** of the validation set defined the quality of the model.
+The loss function used to measure the quality of the prediction algorithm is RMSE calculated as below:
+\begin{center}
+$$RMSE ~ = ~ \sqrt{\frac{1}{N}\sum_{Validation~Set} ~ {(Predicted~ratings - True~ratings)}^2}$$
+\end{center}
+The first step I took is to use a naive prediction model in which I predicted all unknown ratings $r_{u,i}$ with the the overall average $\mu_{0}$: 
+
+\begin{center}
+$$r_{u,i} ~ = ~ {\frac{1}{N}\sum_{train~set}{True~ratings}} ~ = ~ \mu_{0} $$
+\end{center}
+Obviously, any other algorithm should give a better result to worth being considered.  
+From this naive model, I went on with a baseline prediction for an unknown rating $r_{u,i}$. This baseline model accounts for the user and item effects, $b_{u}$ and $b_{i}$ which are the observed deviations of user *u* and item *i* respectively, from the average. In this configuration the baseline predicted rating is formulated as below:
+\begin{center}
+$$r_{u,i} = \mu_{0} + b_{u} + b_{i}$$
+\end{center}
+In this approach, the residual is noted $\epsilon_{u,i}$ when true ratings $Y_{u,i}$ are defined as below:
+\begin{center}
+$$Y_{u,i} = r_{u,i} + \epsilon_{u,i}$$
+\end{center}
+
+\pagebreak
+
+### III-1 MODEL 1: Movies and users effects  
+In this model, I took into account only the user and the movie effects ($b_{u}$ and $b_{i}$) to evaluate the predicted ratings $r_{u,i} = \mu_{0} + b_{u} + b_{i}$ , then calculated RMSE:
+```{r MODEL1, echo=FALSE}
+
+#--- mu is the average ratings of all movies across all users
+mu <- mean(edx$rating)  # 3.512465
+#-----------------------------------------------------------------
+#--- MODEL 0: Naive model
+#-----------------------------------------------------------------
+ predicted_ratings <- validation %>% 
+   mutate(pred = mu) %>%
+   .$pred
+
+ naive_rmse <- RMSE(predicted_ratings, validation$rating)
+ rmse_results <- data_frame(Model  = "MODEL 0",
+                            Description = "Naive",
+                            RMSE   = naive_rmse )
+
+#-----------------------------------------------------------------
+#--- MODEL 1: Movies & users effects
+#-----------------------------------------------------------------
+
+#--- Movie bias: b_i
+movie_avgs <- edx %>% 
+  group_by(movieId) %>% 
+  summarize(b_i = mean(rating - mu))
+
+#--- User bias: b_u
+user_avgs <- edx %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  group_by(userId) %>%
+  summarize(b_u = mean(rating - mu - b_i))
+
+# Predict using item & user bias
+ predicted_ratings <- validation %>% 
+   left_join(movie_avgs, by='movieId') %>%
+   left_join(user_avgs, by='userId') %>%
+   mutate(pred = mu + b_i + b_u) %>%
+   .$pred
+ 
+ # 0.2% of predicted ratings are over 5
+ rate_neg <- sum(predicted_ratings > 5) / length(predicted_ratings) # 2217/1M
+ # Non significant predixted ratings are negative
+ rate_5 <- sum(predicted_ratings < 0) /length(predicted_ratings) # 18/1M
+ 
+ iu_effect_rmse <- RMSE(predicted_ratings, validation$rating)
+ 
+  rmse_results <- bind_rows(rmse_results,
+                            data_frame(
+                              Model  = "MODEL 1",
+                              Description = "Movie & user effects",
+                              RMSE   = iu_effect_rmse )
+                            )
+
+  rmse_results %>% knitr::kable()
+  
+improv <- round(((rmse_results[rmse_results$Model== "MODEL 0", "RMSE"] - rmse_results[rmse_results$Model== "MODEL 1", "RMSE"])/rmse_results[rmse_results$Model== "MODEL 0", "RMSE"])*100,3)
+  
+ rm(movie_avgs, user_avgs, iu_effect_rmse)
+```
+
+Quite a satisfying inprovement of `r round(improv,2)` % from the naive model!
+
+The models -naive and basic studied till now try to predict a continuous variable since the models calculate as predicted ratings any decimal values. But, the true ratings can be seen as a categorical variable since the possible values are limited to every half from 0.5 to 5. Therefore, an idea is to round the predicting ratings to these limited values. At the same time, this will suppress the very few negative and over 5 values. 
+\  
+
+```{r, echo= TRUE}
+# Calculate "categorical" iu_effect rmse
+predicted_ratings[predicted_ratings < 0] <- 0
+predicted_ratings[predicted_ratings == 0] <- 0.5
+predicted_ratings[predicted_ratings > 5] <- 
+predicted_ratings <- round(predicted_ratings/0.5)*0.5
+
+cat_iu_effect_rmse <- RMSE(predicted_ratings, validation$rating)
+
+# Calculate "categorical" naive rmse
+predicted_ratings <- validation %>% 
+   mutate(pred = mu) %>%
+   .$pred
+predicted_ratings[predicted_ratings < 0] <- 0
+predicted_ratings[predicted_ratings == 0] <- 0.5
+predicted_ratings[predicted_ratings > 5] <- 5
+predicted_ratings <- round(predicted_ratings/0.5)*0.5
+
+cat_naive_rmse <- RMSE(predicted_ratings, validation$rating)
+```
+
+\  
+With this adjustment, it seems that rounding the outcomes does not improve the RMSE.
+
+We will check this in chapter *IV- Results*
+\  
+
+```{r, echo= FALSE}
+
+  rmse_results_cat <- bind_cols(rmse_results,
+                                RMSE_cat   = c(cat_naive_rmse, cat_iu_effect_rmse ))
+
+  rmse_results_cat %>% knitr::kable()
+```
+
+
+\pagebreak
+
+### III-2 MODEL 2a: Duo-regularisation
+
+Then I evaluate the penalty parameters $\lambda_{i}$ and $\lambda_{u}$ that constrain the total variability of the effect sizes. First, for each item i we set:\  
+
+$$b_i = {\frac{\sum_{u{\epsilon}R(i) } (r_{u,i} - {\mu})} {{\lambda_i}+ |{R(i)}|}}$$
+That is coded as below:\  
+
+```{r, biCalc, eval= FALSE, echo= TRUE}
+  b_i <- train_edx %>%
+    group_by(movieId) %>%
+    summarize(b_i = sum(rating - mu) / (n() + l1))
+```
+
+Then, for each user u we set:
+$$b_u = {\frac{\sum_{u{\epsilon}R(u) } (r_{u,i} - {\mu} - b_{i})} {{\lambda_u}+ |{R(u)}|}}$$\  
+
+That is coded as below:\  
+
+```{r bu_Calc, eval= FALSE, echo= TRUE}
+  b_u <- train_edx %>%
+    group_by(userId) %>%
+    summarize(b_u = sum(rating - mu)/ (n() + l2))
+```
+\  
+And the results are shown below:\  
+
+```{r MODEL2a_Train1, fig.width=6, fig.height=4, fig.align="center"}
+#-----------------------------------------------------------------
+#--- MODEL 2: MODEL 1 + Regularisation
+# Regularisation permits to 
+# penalise large estimate that comes from small sample size
+#-----------------------------------------------------------------
+# Get lambdas that minimise RMSE
+
+test_index <- createDataPartition(y = edx$rating, times = 1, p = 0.1, list = FALSE) 
+train_edx <- edx[-test_index,]
+temp_edx <- edx[test_index,]
+
+# Make sure userId and movieId in validation set are also in edx set
+test_edx <- temp_edx %>% 
+  semi_join(train_edx, by = "movieId") %>%
+  semi_join(train_edx, by = "userId")
+
+# Add rows removed from validation set back into edx set
+removed <- anti_join(temp_edx, test_edx)
+train_edx <- rbind(train_edx, removed)
+
+rm(temp_edx, test_index, removed)
+
+mu <- mean(train_edx$rating)  # 3.51251
+lambdas <- seq(0,10,0.2)
+
+# Calculate lambda_1:
+# regularization parameter that penalises low ratings movies
+rmses <- sapply(lambdas, function(l1){
+  b_i <- train_edx %>%
+    group_by(movieId) %>%
+    summarize(b_i = sum(rating - mu) / (n() + l1))
+  
+  predicted_ratings <- test_edx %>% 
+    left_join(b_i, by = "movieId") %>%
+    mutate(pred= mu + b_i) %>% .$pred
+  
+  RMSE(predicted_ratings, test_edx$rating)
+})
+
+lambda_i <- lambdas[which.min(rmses)]  
+rmse_min <- min(rmses)
+
+data.frame(lambdas, rmses) %>%       
+  ggplot(aes(lambdas,rmses), fill="steelblue") + 
+  labs(title= expression(paste("RMSE vs ", lambda[i])),
+       subtitle= "Item effect",
+       x = expression(paste(lambda[i])),
+       y = "RMSE") +
+  theme(plot.title = element_text(color="steelblue", size=14, face="bold", hjust = 0.5),
+        plot.subtitle = element_text(color= "steelblue", size= 12, face= "italic", hjust = 0.5),
+        axis.title.x = element_text(color="steelblue", size=11),
+        axis.title.y = element_text(color="steelblue", size=11)) +
+   geom_vline(xintercept= lambda_i, lty= 2, colour = "green",  size= 0.2) +
+   geom_hline(yintercept= rmse_min, lty= 2, colour = "black", size= 0.2) +
+   geom_label(aes(lambda_i, mean(rmses)),       
+             label= round(lambda_i, 2),
+             color= "green") +
+   geom_point()  
+
+```
+\begin{center}
+The computation gives the penalty due to the item effect $\lambda_{i}$  = `r lambda_i`
+\end{center}
+
+```{r MODEL2a_Train2, fig.width=6, fig.height=4, fig.align="center"}
+
+# Calculate lambda_2:
+# regularization parameter that penalises low raters users
+rmses <- sapply(lambdas, function(l2){
+  b_u <- train_edx %>%
+    group_by(userId) %>%
+    summarize(b_u = sum(rating - mu)/ (n() + l2))
+  
+  predicted_ratings <- test_edx %>% 
+    left_join(b_u, by = "userId") %>%
+    mutate(pred= mu + b_u) %>% .$pred
+  
+  RMSE(predicted_ratings, test_edx$rating)
+})
+
+lambda_u <- lambdas[which.min(rmses)] # 5.4
+rmse_min <- min(rmses)
+
+data.frame(lambdas, rmses) %>%       
+  ggplot(aes(lambdas,rmses), fill="steelblue") + 
+  labs(title= expression(paste("RMSE vs ", lambda[u])),
+       subtitle= "User effect",
+       x = expression(paste(lambda[u])),
+       y = "RMSE") +
+  theme(plot.title = element_text(color="steelblue", size=14, face= "bold", hjust= 0.5),
+        plot.subtitle = element_text(color= "steelblue", size= 12, face= "italic", hjust= 0.5),
+        axis.title.x = element_text(color="steelblue", size=11),
+        axis.title.y = element_text(color="steelblue", size=11)) +
+  
+   geom_vline(xintercept= lambda_u, lty= 2, colour = "green",  size= 0.2) +
+   geom_hline(yintercept= rmse_min, lty= 2, colour = "black", size= 0.2) +
+   geom_label(aes(lambda_u, mean(rmses)),       
+             label= round(lambda_u, 2),
+             color= "green") +
+   geom_point()  
+
+```
+
+\begin{center}
+The calculation gives the penalty attached to the user effect: $\lambda_{u}$  = `r lambda_u`.
+The loss function RMSE improves.
+\  
+\end{center}
+
+```{r MODEL2a_Valid, fig.width=3, fig.height=2, fig.align="center"}
+# Predict using item & user bias and regularisation
+b_i <- edx %>%
+  group_by(movieId) %>%
+  summarize(b_i = sum(rating - mu) / (n() + lambda_i))
+
+b_u <- edx %>%
+  left_join(b_i, by= "movieId") %>%
+  group_by(userId) %>%
+  summarize(b_u = sum(rating - mu - b_i) / (n() + lambda_u))
+
+predicted_ratings <- validation %>% 
+  left_join(b_i, by='movieId') %>%
+  left_join(b_u, by='userId') %>%
+  mutate(pred = mu + b_i + b_u) %>%
+  .$pred
+
+regul_rmse <- RMSE(predicted_ratings, validation$rating)
+
+  rmse_results <-  bind_rows(rmse_results,
+                             data_frame(
+                               Model  = "MODEL 2a",
+                               Description = "MODEL 1 + Duo-regularisation",
+                               RMSE   = regul_rmse)
+                             )
+                             
+
+rmse_results %>% knitr::kable()
+improv <- round(((rmse_results[rmse_results$Model=="MODEL 1", "RMSE"]-                         rmse_results[rmse_results$Model=="MODEL 2a", "RMSE"])/rmse_results[rmse_results$Model=="MODEL 1", "RMSE"])*100, 3)
+
+# Calculate "categorical" regul rmse
+predicted_ratings[predicted_ratings < 0] <- 0
+predicted_ratings[predicted_ratings == 0] <- 0.5
+predicted_ratings[predicted_ratings > 5] <- 5
+predicted_ratings <- round(predicted_ratings/0.5)*0.5
+
+cat_regul_rmse <- RMSE(predicted_ratings, validation$rating)
+
+rmse_results_cat <- bind_cols(rmse_results,
+                         RMSE_cat   = c(cat_naive_rmse, cat_iu_effect_rmse, cat_regul_rmse ))
+
+
+rm(predicted_ratings, lambda_i, lambda_u, rmses, regul_rmse)
+```
+
+This first adjustment that deals with two penalty parameters offers an improvement of `r round(improv,3)` %. 
+
+```{r MODELE2b_Train, fig.width=3, fig.height=2, fig.align="center"}
+#-----------------------------------------------------------------
+#--- MODEL 2b: MODEL 1 + uni-Regularisation
+# Regularisation permits to 
+# penalise large estimate that comes from small sample size
+#-----------------------------------------------------------------
+# Calculate lambda:
+# regularization parameter that penalises low ratings movies
+rmses <- sapply(lambdas, function(l){
+  
+  b_i <- train_edx %>%
+    group_by(movieId) %>%
+    summarize(b_i = sum(rating - mu) / (n() + l))
+  
+  b_u <- train_edx %>%
+    left_join(b_i, by="movieId") %>%
+    group_by(userId) %>%
+    summarize(b_u = sum(rating - b_i - mu)/(n() + l))
+  
+  predicted_ratings <-
+    test_edx %>%
+    left_join(b_i, by = "movieId") %>%
+    left_join(b_u, by = "userId") %>%
+    mutate(pred = mu + b_i + b_u) %>%
+    .$pred
+  
+  RMSE(predicted_ratings, test_edx$rating)
+})
+
+lambda <- lambdas[which.min(rmses)]
+rmse_min <- min(rmses)
+```
+
+\pagebreak
+
+### III-3 MODEL 2b: Common regularisation
+
+I wanted to try a single penalty parameter that would apply both to item and user.
+This model that I labeled "MODEL 2b + Uni-regularisation" outputs the unique $\lambda$ equal to `r lambda`
+
+```{r MODEL2b_Valid}
+
+data.frame(lambdas, rmses) %>%       
+  ggplot(aes(lambdas,rmses), fill="steelblue") + 
+  labs(title= expression(paste("RMSE vs ", lambda)),
+       subtitle = "Common effect",
+       x = expression(paste(lambda)),
+       y = "RMSE") +
+   geom_vline(xintercept= lambda, lty= 2, colour = "green",  size= 0.2) +
+   geom_hline(yintercept= rmse_min, lty= 2, colour = "black", size= 0.2) +
+  theme(plot.title = element_text(color="steelblue", size=14, face= "bold", hjust = 0.5),
+        plot.subtitle = element_text(color="steelblue", size=12, face= "italic", hjust = 0.5),
+        axis.title.x = element_text(color="steelblue", size=11),
+        axis.title.y = element_text(color="steelblue", size=11)) +
+   geom_label(aes(lambda, mean(rmses)),       
+             label= round(lambda, 2),
+             color= "green") +
+   geom_point() 
+
+
+b_i <- edx %>%
+  group_by(movieId) %>%
+  summarize(b_i = sum(rating - mu) / (n() + lambda))
+
+b_u <- edx %>%
+  left_join(b_i, by="movieId") %>%
+  group_by(userId) %>%
+  summarize(b_u = sum(rating - b_i - mu)/(n() + lambda))
+
+predicted_ratings <- validation %>% 
+  left_join(b_i, by='movieId') %>%
+  left_join(b_u, by='userId') %>%
+  mutate(pred = mu + b_i + b_u) %>%
+  .$pred
+
+regul1_rmse <- RMSE(predicted_ratings, validation$rating)
+
+  rmse_results <-  bind_rows(rmse_results,
+                             data_frame(
+                               Model  = "MODEL 2b",
+                               Description = "MODEL 1 + Uni-regularisation",
+                               RMSE   = regul1_rmse)
+                             )
+
+
+rmse_results %>% knitr::kable()
+improv <- round(((rmse_results[rmse_results$Model=="MODEL 2a", "RMSE"] - rmse_results[rmse_results$Model=="MODEL 2b", "RMSE"])/rmse_results[rmse_results$Model=="MODEL 2a", "RMSE"])*100,3)
+
+
+# Calculate "categorical" regul1 (Common regul) rmse
+predicted_ratings[predicted_ratings < 0] <- 0
+predicted_ratings[predicted_ratings == 0] <- 0.5
+predicted_ratings[predicted_ratings > 5] <- 5
+predicted_ratings <- round(predicted_ratings/0.5)*0.5
+
+cat_regul1_rmse <- RMSE(predicted_ratings, validation$rating)
+
+rmse_results_cat <- bind_cols(rmse_results,
+                         RMSE_cat   = c(cat_naive_rmse, cat_iu_effect_rmse, 
+                                        cat_regul_rmse, cat_regul1_rmse ))
+
+
+rm(lambdas, rmses, regul1_rmse, predicted_ratings)
+```
+
+But did not improve RMSE that much... Just `r round(improv,3)` %!
+
+There is an assumption in the previous models. I use $\mu_{0}$ (~ `r round(mu, 2)`) the average of all ratings of all movies based on the only rated movies. The assumption was to assign the same mark $\mu_{0}$ to any movie that is not rated by a user. In next model, I try to determine if another average $\mu_{v}$ could give a best result.
+
+\pagebreak
+
+### III-4 MODEL 3: Adjusted average
+
+We make the average vary around $\mu_{0}$ = `r round(mu,2)` and adjust the penalty parameter $\lambda$ for each iteration:
+
+```{r MODEL3_VarAvg1, echo=TRUE ,fig.width=6, fig.height=4, fig.align="center"}
+#-----------------------------------------------------------------
+#--- MODEL 3 : Model 2b + Average adjusted
+#-----------------------------------------------------------------
+
+var_mu <- seq(3.3, 4.2, length.out=20)
+params <- lapply(var_mu, function(avg){
+  
+  lambdas <- seq(2, 7, 0.2)
+  rmses_l <- sapply(lambdas, function(l){
+    
+    b_i <- train_edx %>%
+      group_by(movieId) %>%
+      summarize(b_i = sum(rating - avg) / (n() + l))
+    
+    b_u <- train_edx %>%
+      left_join(b_i, by="movieId") %>%
+      group_by(userId) %>%
+      summarize(b_u = sum(rating - b_i - avg)/(n() + l))
+    
+    predicted_ratings <-
+      test_edx %>%
+      left_join(b_i, by = "movieId") %>%
+      left_join(b_u, by = "userId") %>%
+      mutate(pred = avg + b_i + b_u) %>%
+      .$pred
+    
+    RMSE(predicted_ratings, test_edx$rating)
+    
+  })
+   list(penalty = lambdas[which.min(rmses_l)], 
+        rmse = min(rmses_l))
+})
+```
+
+
+```{r MODEL3_VarAvg2, echo=FALSE,fig.width=6, fig.height=4, fig.align="center"}
+rmse_min <- which.min(unlist(lapply(params, "[", 2)))
+df <- data.frame(average = var_mu, 
+                 rmses   = unlist(lapply(params, "[", 2)),
+                 lambda  = unlist(lapply(params, "[", 1))
+                )
+df_best   <- as.data.frame(df[rmse_min,])
+best_mu   <- var_mu[rmse_min]
+best_l    <- unlist(lapply(params, "[", 1))[rmse_min]
+best_rmse <- unlist(lapply(params, "[", 2))[rmse_min]
+
+df %>%
+  ggplot(aes(average,rmses, label= round(average,2)), fill="steelblue") + 
+  labs(title= expression(paste("RMSE vs ", mu[v])),
+       x = expression(paste(mu[v])),
+       y = "RMSE") +
+  theme(plot.title = element_text(color="steelblue", size=14, face= "bold", hjust = 0.5),
+      axis.title.x = element_text(color="steelblue", size=11, face= "bold"),
+      axis.title.y = element_text(color="steelblue", size=11, face= )) +
+  geom_vline(xintercept= df_best$average, lty= 2, colour = "green",  size= 0.2) +
+  geom_hline(yintercept= df_best$rmses,  lty= 2, colour = "black", size= 0.2) +
+  geom_vline(xintercept= mu, lty= 2, colour = "red", size= 0.2) +
+  geom_label(aes(mu, mean(rmses)),       
+             label= round(mu, 2),
+             color= "red") +
+  geom_label(aes(best_mu, mean(rmses)),       
+             label= round(best_mu, 2),
+             color= "green") +
+  geom_point() 
+
+ 
+b_i <- edx %>%
+  group_by(movieId) %>%
+  summarize(b_i = sum(rating - best_mu) / (n() + best_l))
+
+b_u <- edx %>%
+  left_join(b_i, by="movieId") %>%
+  group_by(userId) %>%
+  summarize(b_u = sum(rating - b_i - best_mu)/(n() + best_l))
+
+predicted_ratings <- validation %>% 
+  left_join(b_i, by='movieId') %>%
+  left_join(b_u, by='userId') %>%
+  mutate(pred = best_mu + b_i + b_u) %>%
+  .$pred
+
+varmu_rmse <- RMSE(predicted_ratings, validation$rating)
+
+    rmse_results <-  bind_rows(rmse_results,
+                             data_frame(
+                               Model  = "MODEL 3",
+                               Description = "MODEL 2b + Adjusted average",
+                               RMSE   = varmu_rmse)
+                             )
+
+rmse_results %>% knitr::kable()
+improv <- round(((rmse_results[rmse_results$Model== "MODEL 2b", "RMSE"] - rmse_results[rmse_results$Model== "MODEL 3", "RMSE"])/rmse_results[rmse_results$Model== "MODEL 2b", "RMSE"])*100,3)
+
+# Calculate "categorical" variable average rmse
+predicted_ratings[predicted_ratings < 0] <- 0
+predicted_ratings[predicted_ratings == 0] <- 0.5
+predicted_ratings[predicted_ratings > 5] <- 5
+predicted_ratings <- round(predicted_ratings/0.5)*0.5
+
+cat_varmu_rmse <- RMSE(predicted_ratings, validation$rating)
+
+rmse_results_cat <- bind_cols(rmse_results,
+                         RMSE_cat   = c(cat_naive_rmse, cat_iu_effect_rmse, 
+                                        cat_regul_rmse, cat_regul1_rmse,
+                                        cat_varmu_rmse))
+
+```
+
+My satisfaction upholds as this algorithm still improves RMSE by `r improv` %, when $\mu_{v}$ is set to `r round(best_mu,2)` and $\lambda$ adjusted to $\lambda_{v}$ = `r round(best_l, 2)`.
+We will use the value $\mu_{v}$ = `r round(best_mu,2)` of the average in next models.
+
+\pagebreak
+
+### III-5 MODEL 4: Model 3 + Factorisation  
+The previous model outputs the rating residuals $\epsilon_{u,i}$:
+
+\begin{center}
+$$\epsilon_{u,i} = Y_{u,i} - \mu_{v} - b_{i} - b_{u}$$
+\end{center}
+
+I used the Singular Value Decomposition algorithm to reduce the sparse matrix to the rank k that explain 90% of variability of the residuals.
+In this configuration residuals is evaluated as:
+\begin{center}
+$$\epsilon_{u,i} = \sum_{n=1}^{k} ~ p_{u,n}  q_{n,i}$$
+\end{center}
+
+
+```{r MODEL4_Train1, echo=TRUE}
+#-----------------------------------------------------------------
+#--- MODEL 4: Model 3 + Factorisation
+#-----------------------------------------------------------------
+# Set average value
+mu <- best_mu
+
+# Transform residuals to a matrix...
+rating_residuals <- edx %>%
+  left_join(b_i, by='movieId') %>% 
+  left_join(b_u, by='userId') %>%
+  mutate(residu= rating - mu - b_i - b_u) %>%
+  select(userId, movieId, residu) %>%
+  spread(movieId, residu)  %>%
+  as.matrix()
+rating_residuals[is.na(rating_residuals)] <- 0
+rownames(rating_residuals) <- rating_residuals[,1]
+rating_residuals <- rating_residuals[,-1]
+
+# ... to reduce using SVD
+svd <- svd(rating_residuals)
+d <- as.matrix(svd$d)
+expl_rate <- cumsum(d^2)/sum(d^2) * 100
+max_k <- dim(d)[1]
+
+# Get k 
+k <- min(which(expl_rate> 90))  #k explains 90% 0f the variability
+# Get reduction rate
+reduc <- ((max_k-k)/max_k) *100
+```
+
+\pagebreak
+
+\begin{center}
+A `r round(reduc,0)` % reduction is applied to the residual matrix, from dimension `r max_k` to rank `r k`.
+\end{center}
+
+
+```{r MODEL4_Train2, echo=FALSE}
+data.frame(dim = 1:max_k, expl_rate) %>%
+  ggplot(aes(dim, expl_rate), fill="steelblue") + 
+  labs(title= "Variability vs Dimenstion",
+       x = "Dimension k",
+       y = "RMSE") +
+  theme(plot.title = element_text(color="steelblue", size=14, face= "bold", hjust = 0.5),
+        axis.title.x = element_text(color="steelblue", size=11),
+        axis.title.y = element_text(color="steelblue", size=11)) +
+  geom_vline(xintercept= k,     lty= 2, colour = "green",  size= 0.2) +
+  geom_hline(yintercept= 90,    lty= 2, colour = "black", size= 0.2) +
+  geom_vline(xintercept= max_k, lty= 2, colour = "red",   size= 0.2) +
+  geom_label(aes(k,10),       
+             label= k,
+             color= "blue") +
+  geom_label(aes(10,90),       
+             label= "90%",
+             color= "black") +
+  geom_label(aes(k,10),       
+             label= k,
+             color= "green") +
+  geom_label(aes(max_k, 10),       
+              label= max_k,
+              color= "red") +
+  geom_line(color= "blue")
+```
+\begin{center} 
+Improvements in the loss function RMSE is shown:
+\end{center}
+
+```{r MODEL4_Train3, echo=FALSE}
+# Evaluate residuals from reduced matrix
+svd_residuals <- with(svd, 
+     sweep(u[, 1:k], 2, d[1:k], FUN= "*") %*% t(v[, 1:k]))
+
+svd_residuals  <- cbind(userId = as.numeric(rownames(rating_residuals)), svd_residuals)
+colnames(svd_residuals) <- c("userId", colnames(rating_residuals))
+
+# Back reduced matrix to data frame
+df_residuals <- svd_residuals %>%
+  as.data.frame() %>% 
+  gather(-userId, key= movieId, value= residu, convert= TRUE) %>%
+  arrange(userId, movieId) 
+
+# Compute predicted ratings
+predicted_ratings <- df_residuals %>% 
+  semi_join(validation, by = c("userId", "movieId")) %>%
+  left_join(b_i, by='movieId') %>%
+  left_join(b_u, by='userId') %>%
+  mutate(pred = mu + b_i + b_u + residu) %>%
+  .$pred
+
+svd_rmse <- RMSE(predicted_ratings, validation$rating)
+
+ rmse_results <-  bind_rows(rmse_results,
+                        data_frame(
+                          Model  = "MODEL 4",
+                          Description = "MODEL 3 + Residuals factorisation (SVD)",
+                          RMSE   = svd_rmse)
+                             )
+  
+rmse_results %>% knitr::kable()
+
+# Improvement
+improv <- round(((rmse_results[rmse_results$Model== "MODEL 4", "RMSE"] - rmse_results[rmse_results$Model== "MODEL 3", "RMSE"])/rmse_results[rmse_results$Model== "MODEL 4", "RMSE"])*100,3)
+
+# Calculate "categorical" variable average rmse
+predicted_ratings[predicted_ratings < 0] <- 0
+predicted_ratings[predicted_ratings == 0] <- 0.5
+predicted_ratings[predicted_ratings > 5] <- 5
+predicted_ratings <- round(predicted_ratings/0.5)*0.5
+
+cat_svd_rmse <- RMSE(predicted_ratings, validation$rating)
+
+rmse_results_cat <- bind_cols(rmse_results,
+                         RMSE_cat   = c(cat_naive_rmse, cat_iu_effect_rmse, 
+                                        cat_regul_rmse, cat_regul1_rmse,
+                                        cat_varmu_rmse, cat_svd_rmse))
+
+
+rm(df_residuals,rating_residuals,svd, svd_residuals, predicted_ratings,expl_rate, d, b_i, b_u)
+```
+
+
+\pagebreak
+
+## IV- Results
+
+
+```{r Results1}
+improv0 <- round(((rmse_results[rmse_results$Model== "MODEL 0", "RMSE"] - rmse_results[rmse_results$Model== "MODEL 4", "RMSE"])/rmse_results[rmse_results$Model== "MODEL 0", "RMSE"])*100,3)
+
+improv1 <- round(((rmse_results[rmse_results$Model== "MODEL 1", "RMSE"] - rmse_results[rmse_results$Model== "MODEL 4", "RMSE"])/rmse_results[rmse_results$Model== "MODEL 1", "RMSE"])*100,3)
+```
+
+The final model where the Single Value Decomposition evaluates the residuals, offers an interesting `r round(improv0,2)` % improvement from the naive model. Even from the basic model -Movie and user effects the improvement is still of `r round(improv1,2)` % to reach a RMSE of `r round(svd_rmse,3)`.
+
+```{r Results2}
+rmse_results %>% knitr::kable()
+
+ rmse_results_cat <- rmse_results_cat %>%
+                       mutate(Improvement = ( ((RMSE-RMSE_cat)/RMSE)*100 ))
+                              
+ max_imp <- rmse_results_cat[which.max(rmse_results_cat$Improvement),"Improvement"]
+```
+
+The rounding of the predicting ratings to the closest 0.5 never improved the loss function:
+
+```{r Results3}
+rmse_results_cat %>% knitr::kable()
+```
+
+
+\pagebreak
+
+## V- Conclusion
+
+A shallow data analysis shows that the less rated genres are often high rated. Probably because these genres of movies like film noir, IMAX, and documentary are watched by a few connoisseurs. On the other hand, action movies that drains many viewers are more likely disappointing.
+
+The first models based on the correction of the item and the user effects generates the RMSE equals to `r round(varmu_rmse,3)`.
+The Single Value Decomposition algorithm applied to the rating residuals lets predict users' ratings to movies with a satisfying RMSE equal to `r round(svd_rmse,3)`.
+Inpsired by Bell and Koren in their paper describing their final solution to the Netflix Prize:  
+
+*While the literature mostly concentrates on the more sophisticated algorithmic aspects, we have learned that an accurate treatment of main effects is probably at least as significant as coming up with modeling breakthroughs.*
+
+Some further explorations should be evaluated:
+
+- hilight and normalise of the genre effect
+- hilight and normalise of the temporal effect
+for example.
+
+I tried to use the package *recommenderlab* with no real success. That should be tempted again.
+It would be also interesting to test ensemble models.
+
+Finally, I want to thank the staff for their very prompt replies to my questions but also HarvardX and the course instructor Rafael Irizarry for the quality of the course.
+
+
